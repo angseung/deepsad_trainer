@@ -1,11 +1,23 @@
 """
-Deep SAD with ResNet50 (ImageNet-21k pretrained) on MNIST
-- PyTorch 2.7+ 호환
-- 재현 가능한 랜덤 시드 고정
-- tqdm 진행상황 시각화
-- Best 모델 저장
-- pip install torch torchvision timm scikit-learn tqdm
+Deep SAD with ResNet50 — 실제 데이터 학습
+
+데이터 구조:
+    DATA_ROOT/
+      unlabeled/  → y=0  (레이블 없는 정상 데이터)
+      normal/     → y=+1 (레이블 있는 정상 데이터)
+      anomaly/    → y=-1 (레이블 있는 이상 데이터)
+
+    TEST_ROOT/
+      normal/     → y=+1
+      anomaly/    → y=-1
+
+사용법:
+    CFG의 data_root / test_root 경로를 설정한 후 실행:
+    python train.py
 """
+
+import os
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -13,11 +25,16 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
-from common import set_seed, DeepSAD_ResNet50, get_dataloaders
+from common import (
+    set_seed,
+    DeepSAD_ResNet50,
+    get_real_dataloaders,
+    get_real_test_loader,
+)
 
 
 # ============================================================
-# 3. 센터 c 초기화
+# 센터 c 초기화
 # ============================================================
 @torch.no_grad()
 def init_center(
@@ -47,7 +64,7 @@ def init_center(
 
 
 # ============================================================
-# 4. Loss 함수
+# Loss 함수
 # ============================================================
 def deepsad_loss(
     z: torch.Tensor,
@@ -70,7 +87,47 @@ def deepsad_loss(
 
 
 # ============================================================
-# 5. 학습 루프 (tqdm 배치 진행바 포함)
+# Warmup 학습 루프 (정상 데이터만, 순수 distance 최소화)
+# ============================================================
+def train_warmup_epoch(
+    model: nn.Module,
+    normal_loader: DataLoader,
+    c: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    n_warmup: int,
+) -> float:
+    """pretrained=False 일 때 warmup에서 사용.
+    정상 데이터만 사용하여 ||z - c||² 를 최소화한다."""
+    model.train()
+    total_loss = 0.0
+
+    pbar = tqdm(
+        normal_loader,
+        desc=f"  [Warmup ] Epoch {epoch:>3}/{n_warmup}",
+        leave=False,
+        ncols=100,
+        colour="magenta",
+    )
+
+    for imgs, _ in pbar:
+        imgs = imgs.to(device, non_blocking=True)
+        z = model(imgs)
+        loss = torch.sum((z - c) ** 2, dim=1).mean()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    return total_loss / len(normal_loader)
+
+
+# ============================================================
+# 학습 루프
 # ============================================================
 def train_one_epoch(
     model: nn.Module,
@@ -80,17 +137,17 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     n_epochs: int,
+    milestone: int,
     eta: float = 1.0,
 ) -> float:
     model.train()
     total_loss = 0.0
-    phase = "Searching  " if epoch <= 50 else "Fine-tuning"
+    phase = "Searching  " if epoch <= milestone else "Fine-tuning"
 
-    # 배치 단위 진행바
     pbar = tqdm(
         train_loader,
         desc=f"  [{phase}] Epoch {epoch:>3}/{n_epochs}",
-        leave=False,  # 에포크 완료 후 진행바 제거
+        leave=False,
         ncols=100,
         colour="green",
     )
@@ -107,15 +164,13 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += loss.item()
-
-        # 배치 진행바에 현재 loss 표시
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     return total_loss / len(train_loader)
 
 
 # ============================================================
-# 6. 검증
+# 검증
 # ============================================================
 @torch.no_grad()
 def evaluate(
@@ -143,7 +198,7 @@ def evaluate(
 
 
 # ============================================================
-# 7. Best 모델 저장 / 불러오기
+# 체크포인트 저장 / 불러오기
 # ============================================================
 def save_checkpoint(
     path: str,
@@ -175,7 +230,7 @@ def load_checkpoint(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
-) -> tuple[int, torch.Tensor, float]:
+) -> tuple[int, torch.Tensor, float, dict]:
     ckpt = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model_state"])
     if optimizer:
@@ -183,52 +238,78 @@ def load_checkpoint(
     if scheduler:
         scheduler.load_state_dict(ckpt["scheduler_state"])
 
+    cfg = ckpt.get("cfg", {})
     print(
-        f"  체크포인트 로드: epoch={ckpt['epoch']}, " f"best_auc={ckpt['best_auc']:.4f}"
+        f"  체크포인트 로드: epoch={ckpt['epoch']}, best_auc={ckpt['best_auc']:.4f}, "
+        f"pretrained={cfg.get('pretrained', 'N/A')}"
     )
-    return ckpt["epoch"], ckpt["c"].to(device), ckpt["best_auc"]
+    return ckpt["epoch"], ckpt["c"].to(device), ckpt["best_auc"], cfg
 
 
 # ============================================================
-# 8. 전체 학습 파이프라인
+# 전체 학습 파이프라인
 # ============================================================
 def main():
     CFG = {
+        # ── 경로 설정 (필수) ──────────────────────────────────
+        "data_root": "./data/test_data",  # unlabeled/ normal/ anomaly/ 가 있는 루트
+        "test_root": "./data/test_data/test",  # normal/ anomaly/ 가 있는 테스트 루트
+        # ── 학습 설정 ─────────────────────────────────────────
         "seed": 42,
-        "normal_class": 1,
-        "gamma_l": 0.05,
-        "gamma_p": 0.0,
-        "batch_size": 128,
+        "batch_size": 64,
         "num_workers": 4,
+        "img_size": 224,
         "proj_dim": 128,
-        "freeze_backbone": False,
+        "pretrained": True,  # True: ImageNet 사전학습 / False: scratch 초기화 + warmup
+        "freeze_backbone": True,  # pretrained=True 일 때만 유효 (backbone 파라미터 동결)
+        "warmup_epochs": 1,  # pretrained=False 일 때만 사용
         "eta": 1.0,
         "lr": 1e-4,
-        "n_epochs": 10,
+        "n_epochs": 100,
         "milestone": 50,
         "weight_decay": 1e-6,
-        "save_path": "deepsad_best.pt",
         "device": "cuda" if torch.cuda.is_available() else "cpu",
     }
+
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+    out_dir = os.path.join("out", timestamp)
+    os.makedirs(out_dir, exist_ok=True)
+    CFG["save_path"] = os.path.join(out_dir, "deepsad_best.pt")
 
     set_seed(CFG["seed"])
     device = torch.device(CFG["device"])
     print(f"Device: {device}")
+    print(f"출력 경로: {out_dir}")
 
     # 데이터
-    train_loader, normal_loader, test_loader = get_dataloaders(
-        normal_class=CFG["normal_class"],
-        gamma_l=CFG["gamma_l"],
-        gamma_p=CFG["gamma_p"],
+    train_loader, normal_loader = get_real_dataloaders(
+        data_root=CFG["data_root"],
         batch_size=CFG["batch_size"],
         num_workers=CFG["num_workers"],
         seed=CFG["seed"],
+        img_size=CFG["img_size"],
+        pretrained=CFG["pretrained"],
+    )
+    test_loader, _, _ = get_real_test_loader(
+        test_root=CFG["test_root"],
+        batch_size=CFG["batch_size"],
+        num_workers=CFG["num_workers"],
+        img_size=CFG["img_size"],
+        pretrained=CFG["pretrained"],
     )
 
+    # freeze_backbone은 pretrained=True 일 때만 유효
+    if CFG["freeze_backbone"] and not CFG["pretrained"]:
+        raise ValueError(
+            "freeze_backbone=True는 pretrained=True 일 때만 사용할 수 있습니다."
+        )
+
     # 모델
+    # freeze_backbone=True 이면 warmup 동안만 동결 → __init__에서 freeze 적용
     model = DeepSAD_ResNet50(
         proj_dim=CFG["proj_dim"],
         freeze_backbone=CFG["freeze_backbone"],
+        pretrained=CFG["pretrained"],
     ).to(device)
 
     optimizer = torch.optim.Adam(
@@ -243,6 +324,39 @@ def main():
     c = init_center(model, normal_loader, device)
     print(f"  c shape={c.shape}, norm={c.norm():.4f}")
 
+    # ── Warmup ───────────────────────────────────────────────
+    # 케이스 1 (scratch):             정상 데이터만, 전 파라미터 학습
+    # 케이스 2 (pretrained+freeze):   정상 데이터만, backbone 동결 → 이후 동결 해제
+    # 케이스 3 (pretrained+no freeze): 정상 데이터만, 전 파라미터 학습
+    n_warmup = CFG["warmup_epochs"]
+    if n_warmup > 0:
+        freeze_warmup = CFG["pretrained"] and CFG["freeze_backbone"]
+
+        freeze_info = ", backbone 동결" if freeze_warmup else ""
+        print(f"\n[1.5단계] Warmup — 정상 데이터로만 {n_warmup} epoch{freeze_info}")
+
+        warmup_pbar = tqdm(
+            range(1, n_warmup + 1), desc="Warmup 진행", ncols=100, colour="magenta"
+        )
+        for w_epoch in warmup_pbar:
+            warmup_loss = train_warmup_epoch(
+                model, normal_loader, c, optimizer, device, w_epoch, n_warmup
+            )
+            warmup_pbar.set_postfix({"loss": f"{warmup_loss:.4f}"})
+
+        if freeze_warmup:
+            # backbone 동결 해제 → 이후 전체 파라미터 학습
+            for param in model.backbone.parameters():
+                param.requires_grad = True
+            tqdm.write(f"  Warmup 완료 | loss={warmup_loss:.4f} | backbone 동결 해제")
+        else:
+            tqdm.write(f"  Warmup 완료 | loss={warmup_loss:.4f}")
+
+        # warmup 후 모델이 변경됐으므로 센터 재초기화
+        print("  센터 c 재초기화")
+        c = init_center(model, normal_loader, device)
+        print(f"  c shape={c.shape}, norm={c.norm():.4f}")
+
     # 학습
     print("\n[2단계] 학습 시작")
     print("=" * 70)
@@ -250,7 +364,6 @@ def main():
     best_auc = 0.0
     best_epoch = 0
 
-    # 에포크 단위 진행바
     epoch_pbar = tqdm(
         range(1, CFG["n_epochs"] + 1),
         desc="전체 진행",
@@ -259,7 +372,6 @@ def main():
     )
 
     for epoch in epoch_pbar:
-        # 학습
         train_loss = train_one_epoch(
             model,
             train_loader,
@@ -268,49 +380,43 @@ def main():
             device,
             epoch,
             CFG["n_epochs"],
+            CFG["milestone"],
             CFG["eta"],
         )
         scheduler.step()
 
-        # 검증 (10 epoch마다 + 마지막 epoch)
         auc = 0.0
-        if epoch % 10 == 0 or epoch == CFG["n_epochs"]:
-            auc = evaluate(model, test_loader, c, device)
+        # if epoch % 10 == 0 or epoch == CFG["n_epochs"]:
+        auc = evaluate(model, test_loader, c, device)
 
-            # Best 모델 저장
-            if auc > best_auc:
-                best_auc = auc
-                best_epoch = epoch
-                save_checkpoint(
-                    path=CFG["save_path"],
-                    epoch=epoch,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    c=c,
-                    best_auc=best_auc,
-                    cfg=CFG,
-                )
-                # tqdm과 겹치지 않도록 write 사용
-                tqdm.write(
-                    f"  ✓ Best 모델 저장 | "
-                    f"Epoch {epoch:>3} | "
-                    f"AUC {best_auc:.4f} → {auc:.4f}"
-                )
+        if auc > best_auc:
+            best_auc = auc
+            best_epoch = epoch
+            save_checkpoint(
+                path=CFG["save_path"],
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                c=c,
+                best_auc=best_auc,
+                cfg=CFG,
+            )
+            tqdm.write(
+                f"  ✓ Best 모델 저장 | Epoch {best_epoch:>3} | AUC {best_auc:.4f}"
+            )
 
-        # 에포크 진행바 우측 정보 업데이트
         phase = "Search" if epoch <= CFG["milestone"] else "FineTune"
         epoch_pbar.set_postfix(
             {
                 "phase": phase,
                 "loss": f"{train_loss:.4f}",
                 "auc": f"{auc:.4f}" if auc > 0 else "-",
-                "best_auc": f"{best_auc:.4f}",
+                "best": f"{best_auc:.4f}",
                 "lr": f"{scheduler.get_last_lr()[0]:.0e}",
             }
         )
 
-    # 최종 결과
     print("\n" + "=" * 70)
     print(f"학습 완료!")
     print(f"  Best AUC   : {best_auc:.4f}")
@@ -320,7 +426,7 @@ def main():
 
     # Best 모델로 최종 평가
     print("\n[3단계] Best 모델 최종 평가")
-    _, c_best, _ = load_checkpoint(CFG["save_path"], model, device)
+    _, c_best, _, _ = load_checkpoint(CFG["save_path"], model, device)
     final_auc = evaluate(model, test_loader, c_best, device)
     print(f"  최종 테스트 AUC: {final_auc:.4f}")
 
