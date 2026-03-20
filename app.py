@@ -543,10 +543,17 @@ def run_model_test(
 
 
 def load_test_images(result_dir: str):
-    """Load all result images from result_dir for the test viewer."""
+    """Load NORMAL and ANOMALY result images separately from result_dir."""
     paths = _collect_images(Path(result_dir))
-    img = paths[0] if paths else None
-    return img, _counter_text(0, len(paths)), paths, 0
+    normal_paths = [p for p in paths if "_NORMAL_" in os.path.basename(p)]
+    anomaly_paths = [p for p in paths if "_ANOMALY_" in os.path.basename(p)]
+    normal_img = normal_paths[0] if normal_paths else None
+    anomaly_img = anomaly_paths[0] if anomaly_paths else None
+    return (
+        normal_img, _counter_text(0, len(normal_paths)),
+        anomaly_img, _counter_text(0, len(anomaly_paths)),
+        normal_paths, anomaly_paths, 0, 0,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -862,21 +869,39 @@ def build_ui() -> gr.Blocks:
                 mt_status = gr.Textbox(label="상태", interactive=False, lines=4)
 
                 gr.Markdown("### 결과 이미지")
-                mt_img = gr.Image(
-                    label="결과 이미지", type="filepath", interactive=False
-                )
                 with gr.Row():
-                    mt_prev_btn = gr.Button("◀ 이전", size="sm")
-                    mt_counter = gr.Textbox(
-                        value="0 / 0",
-                        show_label=False,
-                        interactive=False,
-                        scale=1,
-                    )
-                    mt_next_btn = gr.Button("다음 ▶", size="sm")
+                    # ── NORMAL 블록 ───────────────────────────
+                    with gr.Column():
+                        gr.Markdown("#### NORMAL")
+                        mt_normal_img = gr.Image(
+                            label="정상 샘플", type="filepath", interactive=False
+                        )
+                        with gr.Row():
+                            mt_normal_prev_btn = gr.Button("◀ 이전", size="sm")
+                            mt_normal_counter = gr.Textbox(
+                                value="0 / 0", show_label=False,
+                                interactive=False, scale=1,
+                            )
+                            mt_normal_next_btn = gr.Button("다음 ▶", size="sm")
 
-                mt_paths_state = gr.State([])
-                mt_idx_state = gr.State(0)
+                    # ── ANOMALY 블록 ──────────────────────────
+                    with gr.Column():
+                        gr.Markdown("#### ANOMALY")
+                        mt_anomaly_img = gr.Image(
+                            label="이상 샘플", type="filepath", interactive=False
+                        )
+                        with gr.Row():
+                            mt_anomaly_prev_btn = gr.Button("◀ 이전", size="sm")
+                            mt_anomaly_counter = gr.Textbox(
+                                value="0 / 0", show_label=False,
+                                interactive=False, scale=1,
+                            )
+                            mt_anomaly_next_btn = gr.Button("다음 ▶", size="sm")
+
+                mt_normal_paths_state = gr.State([])
+                mt_anomaly_paths_state = gr.State([])
+                mt_normal_idx_state = gr.State(0)
+                mt_anomaly_idx_state = gr.State(0)
 
         # ── Event wiring ─────────────────────────────────────────────────────
 
@@ -1042,7 +1067,12 @@ def build_ui() -> gr.Blocks:
         )
 
         # Tab 4: run test → load results into viewer
-        _mt_viewer_outputs = [mt_img, mt_counter, mt_paths_state, mt_idx_state]
+        _mt_viewer_outputs = [
+            mt_normal_img, mt_normal_counter,
+            mt_anomaly_img, mt_anomaly_counter,
+            mt_normal_paths_state, mt_anomaly_paths_state,
+            mt_normal_idx_state, mt_anomaly_idx_state,
+        ]
         mt_start_btn.click(
             fn=run_model_test,
             inputs=[
@@ -1055,16 +1085,28 @@ def build_ui() -> gr.Blocks:
             outputs=mt_status,
         ).then(fn=load_test_images, inputs=mt_result_dir, outputs=_mt_viewer_outputs)
 
-        # Tab 4: navigation
-        mt_prev_btn.click(
+        # Tab 4: NORMAL navigation
+        mt_normal_prev_btn.click(
             fn=lambda paths, idx: _navigate(paths, idx, -1),
-            inputs=[mt_paths_state, mt_idx_state],
-            outputs=[mt_img, mt_counter, mt_paths_state, mt_idx_state],
+            inputs=[mt_normal_paths_state, mt_normal_idx_state],
+            outputs=[mt_normal_img, mt_normal_counter, mt_normal_paths_state, mt_normal_idx_state],
         )
-        mt_next_btn.click(
+        mt_normal_next_btn.click(
             fn=lambda paths, idx: _navigate(paths, idx, +1),
-            inputs=[mt_paths_state, mt_idx_state],
-            outputs=[mt_img, mt_counter, mt_paths_state, mt_idx_state],
+            inputs=[mt_normal_paths_state, mt_normal_idx_state],
+            outputs=[mt_normal_img, mt_normal_counter, mt_normal_paths_state, mt_normal_idx_state],
+        )
+
+        # Tab 4: ANOMALY navigation
+        mt_anomaly_prev_btn.click(
+            fn=lambda paths, idx: _navigate(paths, idx, -1),
+            inputs=[mt_anomaly_paths_state, mt_anomaly_idx_state],
+            outputs=[mt_anomaly_img, mt_anomaly_counter, mt_anomaly_paths_state, mt_anomaly_idx_state],
+        )
+        mt_anomaly_next_btn.click(
+            fn=lambda paths, idx: _navigate(paths, idx, +1),
+            inputs=[mt_anomaly_paths_state, mt_anomaly_idx_state],
+            outputs=[mt_anomaly_img, mt_anomaly_counter, mt_anomaly_paths_state, mt_anomaly_idx_state],
         )
 
     return demo
