@@ -1,5 +1,7 @@
 data/
 result/
+.venv/
 venv/
 __pycache__/
 *.pt
+out/

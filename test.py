@@ -16,9 +16,11 @@ Deep SAD — 실제 데이터 추론 및 오분류 시각화
     python test.py
 """
 
+import argparse
 import os
 import sys
 import subprocess
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -26,28 +28,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from common import DeepSAD_ResNet50, set_seed, get_real_test_loader
-
-
-# ============================================================
-# 설정
-# ============================================================
-CFG = {
-    # ── 경로 설정 (필수) ──────────────────────────────────────
-    "checkpoint": "out/2026-03-19-16:45:22/deepsad_best.pt",
-    "test_root": "data/test_data/test",  # normal/ anomaly/ 가 있는 테스트 루트
-    "result_dir": "result",
-    # ── 추론 설정 ─────────────────────────────────────────────
-    "seed": 42,
-    "batch_size": 64,
-    "num_workers": 4,
-    "img_size": 224,
-    "threshold_percentile": 90,  # 정상 score의 상위 N% 를 임계값으로 사용
-    "num_tp_samples": 50,  # TP 랜덤 샘플 수
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
-}
-
-for _sub in ("FP", "FN", "TP"):
-    os.makedirs(os.path.join(CFG["result_dir"], _sub), exist_ok=True)
+from config import TestConfig, TrainConfig
 
 
 # ============================================================
@@ -293,23 +274,38 @@ def save_and_display(
 # 메인
 # ============================================================
 def main():
-    set_seed(CFG["seed"])
-    rng = np.random.RandomState(CFG["seed"])
-    device = torch.device(CFG["device"])
+    parser = argparse.ArgumentParser(description="Deep SAD 추론 및 시각화")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="추론 설정 YAML 파일 경로 (기본값: test.yaml 이 있으면 로드, 없으면 기본값 사용)",
+    )
+    args = parser.parse_args()
+
+    _cfg_file = args.config if args.config is not None else Path("test.yaml")
+    cfg = TestConfig.from_yaml(_cfg_file) if _cfg_file.exists() else TestConfig()
+
+    for _sub in ("FP", "FN", "TP"):
+        os.makedirs(os.path.join(cfg.result_dir, _sub), exist_ok=True)
+
+    set_seed(cfg.seed)
+    rng = np.random.RandomState(cfg.seed)
+    device = torch.device(cfg.device)
     print(f"Device: {device}")
 
     # 체크포인트 로드
-    print(f"\n[1단계] 체크포인트 로드: {CFG['checkpoint']}")
-    ckpt = torch.load(CFG["checkpoint"], map_location=device, weights_only=True)
-    saved_cfg = ckpt["cfg"]
+    print(f"\n[1단계] 체크포인트 로드: {cfg.checkpoint}")
+    ckpt = torch.load(cfg.checkpoint, map_location=device, weights_only=True)
+    saved_cfg = TrainConfig(**ckpt.get("cfg", {}))
     c = ckpt["c"].to(device)
     print(f"  저장 epoch : {ckpt['epoch']}")
     print(f"  Best AUC   : {ckpt['best_auc']:.4f}")
 
     # 모델 복원
     model = DeepSAD_ResNet50(
-        proj_dim=saved_cfg["proj_dim"],
-        freeze_backbone=saved_cfg["freeze_backbone"],
+        proj_dim=saved_cfg.proj_dim,
+        freeze_backbone=saved_cfg.freeze_backbone,
         pretrained=False,  # 가중치를 직접 로드하므로 사전학습 불필요
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
@@ -319,11 +315,11 @@ def main():
     # 테스트 데이터 로드
     print("\n[2단계] 테스트 데이터 로드")
     test_loader, file_paths, test_labels = get_real_test_loader(
-        test_root=CFG["test_root"],
-        batch_size=CFG["batch_size"],
-        num_workers=CFG["num_workers"],
-        img_size=CFG["img_size"],
-        pretrained=saved_cfg.get("pretrained", True),
+        test_root=cfg.test_root,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        img_size=cfg.img_size,
+        pretrained=saved_cfg.pretrained,
     )
 
     # 이상 점수 계산
@@ -335,13 +331,13 @@ def main():
     )
 
     # 임계값: 정상 샘플 score의 상위 percentile
-    threshold = float(np.percentile(scores, CFG["threshold_percentile"]))
-    print(f"  Threshold (p{CFG['threshold_percentile']}): {threshold:.4f}")
+    threshold = float(np.percentile(scores, cfg.threshold_percentile))
+    print(f"  Threshold (p{cfg.threshold_percentile}): {threshold:.4f}")
 
     # 샘플 분류
     print("\n[4단계] 샘플 탐지")
     fp_idx, fn_idx, tp_idx = find_samples(
-        scores, test_labels, threshold, rng, CFG["num_tp_samples"]
+        scores, test_labels, threshold, rng, cfg.num_tp_samples
     )
 
     # FP: score 높은 순 / FN: score 낮은 순 / TP: 랜덤
@@ -357,13 +353,13 @@ def main():
             scores=scores,
             threshold=threshold,
             sample_type=stype,
-            result_dir=CFG["result_dir"],
+            result_dir=cfg.result_dir,
         )
 
-    print(f"\n[완료] 결과 저장 경로: {CFG['result_dir']}/")
+    print(f"\n[완료] 결과 저장 경로: {cfg.result_dir}/")
     for stype in ("FP", "FN", "TP"):
-        print(f"  {CFG['result_dir']}/{stype}/")
-        print(f"  {CFG['result_dir']}/{stype}_grid.png")
+        print(f"  {cfg.result_dir}/{stype}/")
+        print(f"  {cfg.result_dir}/{stype}_grid.png")
 
 
 if __name__ == "__main__":
