@@ -22,6 +22,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -66,6 +67,8 @@ def init_center(
     c[(c.abs() < eps) & (c >= 0)] = eps
 
     return c
+
+
 
 
 # ============================================================
@@ -183,7 +186,11 @@ def evaluate(
     test_loader: DataLoader,
     c: torch.Tensor,
     device: torch.device,
-) -> float:
+) -> tuple[float, np.ndarray]:
+    """Returns (auc, normal_scores) in a single pass.
+
+    normal_scores: scores of label=+1 samples, used for threshold computation.
+    """
     model.eval()
     all_scores, all_labels = [], []
 
@@ -199,7 +206,9 @@ def evaluate(
     all_labels = torch.cat(all_labels).numpy()
     binary_labels = (all_labels == -1).astype(int)
 
-    return roc_auc_score(binary_labels, all_scores)
+    auc = roc_auc_score(binary_labels, all_scores)
+    normal_scores = all_scores[all_labels == 1]
+    return auc, normal_scores
 
 
 # ============================================================
@@ -261,6 +270,7 @@ def save_checkpoint(
     c: torch.Tensor,
     best_auc: float,
     cfg: TrainConfig,
+    threshold: float = 0.0,
 ):
     torch.save(
         {
@@ -270,6 +280,7 @@ def save_checkpoint(
             "scheduler_state": scheduler.state_dict(),
             "c": c,
             "best_auc": best_auc,
+            "threshold": threshold,
             "cfg": cfg.model_dump(),
         },
         path,
@@ -282,7 +293,7 @@ def load_checkpoint(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
-) -> tuple[int, torch.Tensor, float, TrainConfig]:
+) -> tuple[int, torch.Tensor, float, TrainConfig, float]:
     ckpt = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model_state"])
     if optimizer:
@@ -291,11 +302,12 @@ def load_checkpoint(
         scheduler.load_state_dict(ckpt["scheduler_state"])
 
     cfg = TrainConfig(**ckpt.get("cfg", {}))
+    threshold = float(ckpt.get("threshold", 0.0))
     print(
         f"  체크포인트 로드: epoch={ckpt['epoch']}, best_auc={ckpt['best_auc']:.4f}, "
-        f"pretrained={cfg.pretrained}"
+        f"threshold={threshold:.4f}, pretrained={cfg.pretrained}"
     )
-    return ckpt["epoch"], ckpt["c"].to(device), ckpt["best_auc"], cfg
+    return ckpt["epoch"], ckpt["c"].to(device), ckpt["best_auc"], cfg, threshold
 
 
 # ============================================================
@@ -309,14 +321,29 @@ def main():
         default=None,
         help="학습 설정 YAML 파일 경로 (기본값: train.yaml 이 있으면 로드, 없으면 기본값 사용)",
     )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="이어서 학습할 체크포인트 경로 (보통 last.pt)",
+    )
     args = parser.parse_args()
 
-    _cfg_file = args.config if args.config is not None else Path("train.yaml")
-    cfg = TrainConfig.from_yaml(_cfg_file) if _cfg_file.exists() else TrainConfig()
+    # ── 설정 로드 ─────────────────────────────────────────────
+    if args.resume is not None:
+        # 체크포인트에 저장된 cfg를 기본값으로 사용, --config로 덮어쓰기 가능
+        ckpt_for_cfg = torch.load(args.resume, map_location="cpu", weights_only=True)
+        cfg = TrainConfig(**ckpt_for_cfg.get("cfg", {}))
+        if args.config is not None and args.config.exists():
+            cfg = TrainConfig.from_yaml(args.config)
+        out_dir = args.resume.parent
+    else:
+        _cfg_file = args.config if args.config is not None else Path("train.yaml")
+        cfg = TrainConfig.from_yaml(_cfg_file) if _cfg_file.exists() else TrainConfig()
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+        out_dir = Path("out") / timestamp
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-    out_dir = Path("out") / timestamp
-    out_dir.mkdir(parents=True, exist_ok=True)
     save_path = str(out_dir / "best.pt")
     last_path = str(out_dir / "last.pt")
 
@@ -367,57 +394,67 @@ def main():
     scheduler = build_scheduler(optimizer, cfg)
     logger.log_lr_schedule(cfg, str(out_dir / "lr_schedule.png"))
 
-    # 센터 초기화
-    print("\n[1단계] 센터 c 초기화")
-    c = init_center(model, normal_loader, device)
-    print(f"  c shape={c.shape}, norm={c.norm():.4f}")
-
-    # ── Warmup ───────────────────────────────────────────────
-    # 공통: warmup 전용 SGD 옵티마이저 사용, 스케줄러 없음
-    # backbone 동결 여부: freeze_backbone_warmup (warmup) / freeze_backbone_train (본 학습)
-    n_warmup = cfg.warmup_epochs
-    if n_warmup > 0:
-        warmup_optimizer = torch.optim.SGD(model.parameters(), lr=cfg.warmup_lr)
-
-        freeze_info = ", backbone 동결" if cfg.freeze_backbone_warmup else ""
-        print(
-            f"\n[1.5단계] Warmup — 정상 데이터로만 {n_warmup} epoch"
-            f"{freeze_info}  (SGD lr={cfg.warmup_lr})"
+    # ── Resume 또는 신규 시작 ──────────────────────────────────
+    if args.resume is not None:
+        print(f"\n[재개] 체크포인트 로드: {args.resume}")
+        start_epoch, c, best_auc, _, best_threshold = load_checkpoint(
+            str(args.resume), model, device, optimizer, scheduler
         )
-
-        warmup_pbar = tqdm(
-            range(1, n_warmup + 1), desc="Warmup 진행", ncols=100, colour="magenta"
-        )
-        for w_epoch in warmup_pbar:
-            warmup_loss = train_warmup_epoch(
-                model, normal_loader, c, warmup_optimizer, device, w_epoch, n_warmup
-            )
-            warmup_pbar.set_postfix({"loss": f"{warmup_loss:.4f}"})
-            logger.log_warmup(warmup_loss, w_epoch)
-
-        # 본 학습용 backbone 동결 상태 적용
-        if cfg.pretrained:
-            for param in model.backbone.parameters():
-                param.requires_grad = not cfg.freeze_backbone_train
-            status = "동결 유지" if cfg.freeze_backbone_train else "동결 해제"
-            tqdm.write(f"  Warmup 완료 | loss={warmup_loss:.4f} | backbone {status}")
-        else:
-            tqdm.write(f"  Warmup 완료 | loss={warmup_loss:.4f}")
-
-        # warmup 후 모델이 변경됐으므로 센터 재초기화
-        print("  센터 c 재초기화")
+        start_epoch += 1
+        best_epoch = start_epoch - 1
+        print(f"  epoch {start_epoch}부터 재개 | best_auc={best_auc:.4f}")
+    else:
+        # 센터 초기화
+        print("\n[1단계] 센터 c 초기화")
         c = init_center(model, normal_loader, device)
         print(f"  c shape={c.shape}, norm={c.norm():.4f}")
+
+        # ── Warmup ───────────────────────────────────────────
+        n_warmup = cfg.warmup_epochs
+        if n_warmup > 0:
+            warmup_optimizer = torch.optim.SGD(model.parameters(), lr=cfg.warmup_lr)
+
+            freeze_info = ", backbone 동결" if cfg.freeze_backbone_warmup else ""
+            print(
+                f"\n[1.5단계] Warmup — 정상 데이터로만 {n_warmup} epoch"
+                f"{freeze_info}  (SGD lr={cfg.warmup_lr})"
+            )
+
+            warmup_pbar = tqdm(
+                range(1, n_warmup + 1), desc="Warmup 진행", ncols=100, colour="magenta"
+            )
+            for w_epoch in warmup_pbar:
+                warmup_loss = train_warmup_epoch(
+                    model, normal_loader, c, warmup_optimizer, device, w_epoch, n_warmup
+                )
+                warmup_pbar.set_postfix({"loss": f"{warmup_loss:.4f}"})
+                logger.log_warmup(warmup_loss, w_epoch)
+
+            # 본 학습용 backbone 동결 상태 적용
+            if cfg.pretrained:
+                for param in model.backbone.parameters():
+                    param.requires_grad = not cfg.freeze_backbone_train
+                status = "동결 유지" if cfg.freeze_backbone_train else "동결 해제"
+                tqdm.write(f"  Warmup 완료 | loss={warmup_loss:.4f} | backbone {status}")
+            else:
+                tqdm.write(f"  Warmup 완료 | loss={warmup_loss:.4f}")
+
+            # warmup 후 모델이 변경됐으므로 센터 재초기화
+            print("  센터 c 재초기화")
+            c = init_center(model, normal_loader, device)
+            print(f"  c shape={c.shape}, norm={c.norm():.4f}")
+
+        start_epoch = 1
+        best_auc = 0.0
+        best_epoch = 0
+        best_threshold = 0.0
 
     # 학습
     print("\n[2단계] 학습 시작")
     print("=" * 70)
 
-    best_auc = 0.0
-    best_epoch = 0
-
     epoch_pbar = tqdm(
-        range(1, cfg.n_epochs + 1),
+        range(start_epoch, cfg.n_epochs + 1),
         desc="전체 진행",
         ncols=100,
         colour="blue",
@@ -438,13 +475,12 @@ def main():
         )
         scheduler.step()
 
-        auc = 0.0
-        # if epoch % 10 == 0 or epoch == cfg.n_epochs:
-        auc = evaluate(model, test_loader, c, device)
+        auc, normal_scores = evaluate(model, test_loader, c, device)
 
         if auc > best_auc:
             best_auc = auc
             best_epoch = epoch
+            best_threshold = float(np.percentile(normal_scores, cfg.threshold_percentile))
             save_checkpoint(
                 path=save_path,
                 epoch=epoch,
@@ -454,9 +490,11 @@ def main():
                 c=c,
                 best_auc=best_auc,
                 cfg=cfg,
+                threshold=best_threshold,
             )
             tqdm.write(
                 f"  ✓ Best 모델 저장 | Epoch {best_epoch:>3} | AUC {best_auc:.4f}"
+                f" | Threshold {best_threshold:.4f}"
             )
 
         # last.pt — 매 에포크 갱신
@@ -469,6 +507,7 @@ def main():
             c=c,
             best_auc=best_auc,
             cfg=cfg,
+            threshold=best_threshold,
         )
 
         # 주기 저장 (save_interval > 0 일 때만)
@@ -483,6 +522,7 @@ def main():
                 c=c,
                 best_auc=best_auc,
                 cfg=cfg,
+                threshold=best_threshold,
             )
             # tqdm.write(f"  [interval] epoch_{epoch:04d}.pt 저장")
 
@@ -508,8 +548,8 @@ def main():
 
     # Best 모델로 최종 평가
     print("\n[3단계] Best 모델 최종 평가")
-    _, c_best, _, _ = load_checkpoint(save_path, model, device)
-    final_auc = evaluate(model, test_loader, c_best, device)
+    _, c_best, _, _, _ = load_checkpoint(save_path, model, device)
+    final_auc, _ = evaluate(model, test_loader, c_best, device)
     print(f"  최종 테스트 AUC: {final_auc:.4f}")
 
     logger.log_hparams(cfg, best_auc, final_auc)

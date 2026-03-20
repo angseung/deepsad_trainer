@@ -26,8 +26,8 @@ class TrainConfig(BaseModel):
     # ── model ────────────────────────────────────────────────
     proj_dim: int = 128
     pretrained: bool = True
-    freeze_backbone_warmup: bool = True   # warmup 동안 backbone 동결 여부
-    freeze_backbone_train: bool = False   # 본 학습 동안 backbone 동결 여부
+    freeze_backbone_warmup: bool = True  # warmup 동안 backbone 동결 여부
+    freeze_backbone_train: bool = False  # 본 학습 동안 backbone 동결 여부
     # ── training ─────────────────────────────────────────────
     seed: int = 42
     batch_size: int = 64
@@ -36,10 +36,13 @@ class TrainConfig(BaseModel):
     warmup_epochs: int = 1
     warmup_lr: float = 1e-3  # warmup 전용 SGD 학습률 (본 학습 lr 과 별도)
     save_interval: int = -1  # -1: best + last 만 저장 / N>0: N 에포크마다 추가 저장
+    threshold_percentile: int = (
+        95  # normal score 분포의 몇 percentile을 threshold로 사용
+    )
     # ── scheduler ────────────────────────────────────────────
-    scheduler: str = "multistep"          # multistep | onecycle | combined
-    onecycle_pct_start: float = 0.3      # warmup 비율 (전체 에포크 대비)
-    onecycle_div_factor: float = 25.0    # 초기 lr = lr / div_factor
+    scheduler: str = "multistep"  # multistep | onecycle | combined
+    onecycle_pct_start: float = 0.3  # warmup 비율 (전체 에포크 대비)
+    onecycle_div_factor: float = 25.0  # 초기 lr = lr / div_factor
     onecycle_final_div_factor: float = 1.0e4  # 최소 lr = lr / final_div_factor
     eta: float = 1.0
     lr: float = 1e-4
@@ -72,13 +75,12 @@ class TestConfig(BaseModel):
     # ── paths ────────────────────────────────────────────────
     checkpoint: str = "out/deepsad_best.pt"
     test_root: str = "data/test_data/test"
-    result_dir: str = "result"
+    result_dir: str = "out/result"
     # ── inference ────────────────────────────────────────────
     seed: int = 42
     batch_size: int = 64
     num_workers: int = 4
     img_size: int = 224
-    threshold_percentile: int = 90
     num_tp_samples: int = 50
     device: str = Field(
         default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu"

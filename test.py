@@ -18,8 +18,6 @@ Deep SAD — 실제 데이터 추론 및 오분류 시각화
 
 import argparse
 import os
-import sys
-import subprocess
 from pathlib import Path
 
 import cv2
@@ -30,26 +28,7 @@ from torch.utils.data import DataLoader
 from common import DeepSAD_ResNet50, set_seed, get_real_test_loader
 from config import TestConfig, TrainConfig
 
-
-# ============================================================
-# OS 기본 이미지 뷰어로 열기
-# ============================================================
-def open_image(path: str):
-    if sys.platform == "linux":
-        for viewer in ["xdg-open", "eog", "feh"]:
-            try:
-                subprocess.Popen(
-                    [viewer, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                print(f"  이미지 열기: {viewer} {path}")
-                return
-            except FileNotFoundError:
-                continue
-        print(f"  뷰어를 찾을 수 없습니다. 직접 열어주세요: {path}")
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", path])
-    elif sys.platform == "win32":
-        os.startfile(path)
+MAX_NUM_SAMPLES_FOR_VIS = 100
 
 
 # ============================================================
@@ -197,10 +176,53 @@ def draw_result_image(
     return img
 
 
+def draw_inference_image(
+    file_path: str,
+    score: float,
+    threshold: float,
+    canvas_size: int = 300,
+) -> np.ndarray:
+    """Draw inference result image (NORMAL / ANOMALY) without ground truth."""
+    is_anomaly = score > threshold
+    border_color = (255, 80, 80) if is_anomaly else (80, 200, 80)
+    label_color = (255, 180, 80) if is_anomaly else (80, 255, 120)
+    header_text = "ANOMALY" if is_anomaly else "NORMAL"
+
+    img = cv2.imread(file_path)
+    if img is None:
+        img = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
+    else:
+        img = cv2.resize(img, (canvas_size, canvas_size))
+
+    t = 6
+    cv2.rectangle(
+        img,
+        (t // 2, t // 2),
+        (canvas_size - t // 2, canvas_size - t // 2),
+        border_color,
+        t,
+    )
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (canvas_size, 62), (40, 40, 40), -1)
+    cv2.addWeighted(overlay, 0.72, img, 0.28, 0, img)
+
+    cv2.putText(img, header_text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.47, label_color, 1, cv2.LINE_AA)
+    cv2.putText(img, f"Score: {score:.4f}", (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(img, f"Thr  : {threshold:.4f}", (8, 57), cv2.FONT_HERSHEY_SIMPLEX, 0.41, (160, 160, 160), 1, cv2.LINE_AA)
+
+    fname = os.path.basename(file_path)
+    if len(fname) > 22:
+        fname = fname[:19] + "..."
+    cv2.putText(img, fname, (8, canvas_size - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1, cv2.LINE_AA)
+
+    return img
+
+
 # ============================================================
 # 저장 및 그리드 출력
 # ============================================================
-def save_and_display(
+def draw_and_save(
     file_paths: list[str],
     indices: np.ndarray,
     scores: np.ndarray,
@@ -209,13 +231,15 @@ def save_and_display(
     result_dir: str,
     canvas_size: int = 300,
     grid_cols: int = 5,
-    max_display: int = 50,
+    max_num_samples_for_visualize: int = MAX_NUM_SAMPLES_FOR_VIS,
 ):
     if len(indices) == 0:
         print(f"  {sample_type}: 해당 샘플 없음")
         return
 
-    display_idx = indices[:max_display]
+    max_num_samples_for_visualize = min(max_num_samples_for_visualize, len(indices))
+
+    display_idx = indices[:max_num_samples_for_visualize]
 
     img_list = []
     for i, idx in enumerate(display_idx):
@@ -267,7 +291,6 @@ def save_and_display(
     grid_path = os.path.join(result_dir, f"{sample_type}_grid.png")
     cv2.imwrite(grid_path, grid)
     print(f"  {sample_type} 그리드 저장: {grid_path}")
-    open_image(grid_path)
 
 
 # ============================================================
@@ -305,7 +328,7 @@ def main():
     # 모델 복원
     model = DeepSAD_ResNet50(
         proj_dim=saved_cfg.proj_dim,
-        freeze_backbone=saved_cfg.freeze_backbone,
+        freeze_backbone=saved_cfg.freeze_backbone_train,
         pretrained=False,  # 가중치를 직접 로드하므로 사전학습 불필요
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
@@ -330,9 +353,14 @@ def main():
         f"mean={scores.mean():.4f}  std={scores.std():.4f}"
     )
 
-    # 임계값: 정상 샘플 score의 상위 percentile
-    threshold = float(np.percentile(scores, cfg.threshold_percentile))
-    print(f"  Threshold (p{cfg.threshold_percentile}): {threshold:.4f}")
+    # 임계값: 학습 시 저장된 값 사용
+    threshold = float(ckpt.get("threshold", 0.0))
+    if threshold == 0.0:
+        raise ValueError(
+            "체크포인트에 threshold가 없습니다. 해당 모델을 재학습하거나 "
+            "최신 train.py로 저장된 체크포인트를 사용하세요."
+        )
+    print(f"  Threshold (from checkpoint): {threshold:.4f}")
 
     # 샘플 분류
     print("\n[4단계] 샘플 탐지")
@@ -347,13 +375,16 @@ def main():
     # 시각화 및 저장
     print("\n[5단계] 시각화 및 저장")
     for idx_arr, stype in [(fp_idx, "FP"), (fn_idx, "FN"), (tp_idx, "TP")]:
-        save_and_display(
+        draw_and_save(
             file_paths=file_paths,
             indices=idx_arr,
             scores=scores,
             threshold=threshold,
             sample_type=stype,
             result_dir=cfg.result_dir,
+            max_num_samples_for_visualize=(
+                cfg.num_tp_samples if stype == "TP" else MAX_NUM_SAMPLES_FOR_VIS
+            ),
         )
 
     print(f"\n[완료] 결과 저장 경로: {cfg.result_dir}/")

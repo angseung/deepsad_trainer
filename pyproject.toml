@@ -16,6 +16,8 @@ dependencies = [
     "matplotlib>=3.10.8",
     "tensorboard>=2.19.0",
     "setuptools>=68.0,<72.0",
+    "gradio>=5.0.0",
+    "pyqt6>=6.7.0",
 ]
 
 [tool.uv.sources]
