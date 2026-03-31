@@ -1,0 +1,33 @@
+# Deep SAD — 학습 설정
+# 사용법: python train.py --config configs/train.yaml
+
+# ── paths ──────────────────────────────────────────────────
+data_root: ./data/test_data        # unlabeled/ normal/ anomaly/ 가 있는 루트
+test_root: ./data/test_data/test   # normal/ anomaly/ 가 있는 테스트 루트
+
+# ── model ──────────────────────────────────────────────────
+proj_dim: 128          # projection head 출력 차원
+pretrained: true       # true: ImageNet 사전학습 backbone / false: scratch 초기화
+freeze_backbone_warmup: true   # warmup 동안 backbone 동결 여부
+freeze_backbone_train: false   # 본 학습 동안 backbone 동결 여부
+
+# ── training ───────────────────────────────────────────────
+seed: 42
+batch_size: 64
+num_workers: 4
+img_size: 224          # 입력 이미지 크기 (ResNet50 기본값)
+warmup_epochs: 5       # 정상 데이터로만 warmup할 에포크 수 (0이면 warmup 생략)
+warmup_lr: 0.001       # warmup 전용 SGD 학습률
+save_interval: 10      # 주기 체크포인트 저장 간격 (-1: best + last 만 저장)
+eta: 1.0               # 레이블 샘플의 loss 가중치 (η)
+lr: 0.0001             # 본 학습 Adam 초기 학습률
+n_epochs: 100          # 본 학습 총 에포크 수
+milestone: 50          # lr 스텝다운 시점 (×0.1) — MultiStepLR 및 복합 스케줄 공통
+weight_decay: 1e-6     # Adam weight decay
+device: cuda           # cuda / cpu
+
+# ── scheduler ──────────────────────────────────────────────
+scheduler: onecycle             # multistep | onecycle | combined
+onecycle_pct_start: 0.1         # warmup 비율 (전체 에포크 대비)
+onecycle_div_factor: 25.0       # 초기 lr = lr / div_factor
+onecycle_final_div_factor: 1e4  # 최소 lr = lr / final_div_factor

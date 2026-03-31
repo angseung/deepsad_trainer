@@ -1,0 +1,16 @@
+# Deep SAD — 추론 설정
+# 사용법: python test.py --config configs/test.yaml
+
+# ── paths ──────────────────────────────────────────────────
+checkpoint: out/deepsad_best.pt   # 로드할 체크포인트 경로 (best.pt or last.pt)
+test_root: data/test_data/test    # normal/ anomaly/ 가 있는 테스트 루트
+result_dir: result                # FP / FN / TP 이미지 저장 루트
+
+# ── inference ──────────────────────────────────────────────
+seed: 42
+batch_size: 64
+num_workers: 4
+img_size: 224
+threshold_percentile: 90   # 정상 score의 상위 N%를 임계값으로 사용
+num_tp_samples: 50         # TP 랜덤 샘플 수
+device: cuda               # cuda / cpu
