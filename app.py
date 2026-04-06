@@ -542,6 +542,63 @@ def run_model_test(
     )
 
 
+def run_score_distribution(
+    checkpoint: str,
+    dist_root: str,
+    img_size: int,
+    device: str,
+):
+    """Run inference on a labeled directory (normal/ anomaly/ subfolders) and return score distribution plot."""
+    import torch
+
+    from common import DeepSAD_ResNet50, get_real_test_loader
+    from config import TrainConfig
+    from test import compute_scores, plot_score_distribution
+
+    device_t = torch.device(device)
+    try:
+        ckpt = torch.load(str(checkpoint), map_location=device_t, weights_only=True)
+    except Exception as e:
+        return None, f"체크포인트 로드 실패: {e}"
+
+    threshold = float(ckpt.get("threshold", 0.0))
+    if threshold == 0.0:
+        return None, "체크포인트에 threshold가 없습니다."
+
+    saved_cfg = TrainConfig(**ckpt.get("cfg", {}))
+    c = ckpt["c"].to(device_t)
+
+    model = DeepSAD_ResNet50(
+        proj_dim=saved_cfg.proj_dim,
+        freeze_backbone=saved_cfg.freeze_backbone_train,
+        pretrained=False,
+    ).to(device_t)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    try:
+        test_loader, _, labels = get_real_test_loader(
+            test_root=str(dist_root),
+            batch_size=32,
+            num_workers=0,
+            img_size=int(img_size),
+            pretrained=saved_cfg.pretrained,
+        )
+    except Exception as e:
+        return None, f"데이터 로드 실패: {e}"
+
+    scores = compute_scores(model, test_loader, c, device_t)
+    fig = plot_score_distribution(scores, labels, threshold)
+
+    n_normal = int((labels == 1).sum())
+    n_anomaly = int((labels == -1).sum())
+    status = (
+        f"완료: 정상 {n_normal}개, 이상 {n_anomaly}개\n"
+        f"Threshold (from checkpoint): {threshold:.4f}"
+    )
+    return fig, status
+
+
 def load_test_images(result_dir: str):
     """Load NORMAL and ANOMALY result images separately from result_dir."""
     paths = _collect_images(Path(result_dir))
@@ -903,6 +960,21 @@ def build_ui() -> gr.Blocks:
                 mt_normal_idx_state = gr.State(0)
                 mt_anomaly_idx_state = gr.State(0)
 
+                gr.Markdown("### Score 분포 시각화")
+                gr.Markdown(
+                    "데이터 루트에 `normal/` 과 `anomaly/` 서브폴더가 있어야 합니다."
+                )
+                with gr.Row():
+                    mt_dist_root = gr.Textbox(
+                        label="데이터 루트 (normal/ anomaly/ 포함)",
+                        value="",
+                        scale=5,
+                    )
+                    mt_dist_root_btn = gr.Button("탐색", scale=1, size="sm")
+                mt_dist_btn = gr.Button("분포 시각화", variant="secondary")
+                mt_dist_status = gr.Textbox(label="상태", interactive=False, lines=2)
+                mt_dist_plot = gr.Plot(label="Score Distribution")
+
         # ── Event wiring ─────────────────────────────────────────────────────
 
         # Tab 2: TensorBoard
@@ -1107,6 +1179,18 @@ def build_ui() -> gr.Blocks:
             fn=lambda paths, idx: _navigate(paths, idx, +1),
             inputs=[mt_anomaly_paths_state, mt_anomaly_idx_state],
             outputs=[mt_anomaly_img, mt_anomaly_counter, mt_anomaly_paths_state, mt_anomaly_idx_state],
+        )
+
+        # Tab 4: score distribution folder picker
+        mt_dist_root_btn.click(
+            fn=pick_folder, inputs=mt_dist_root, outputs=mt_dist_root
+        )
+
+        # Tab 4: score distribution plot
+        mt_dist_btn.click(
+            fn=run_score_distribution,
+            inputs=[mt_checkpoint, mt_dist_root, mt_img_size, mt_device],
+            outputs=[mt_dist_plot, mt_dist_status],
         )
 
     return demo

@@ -75,7 +75,7 @@ def find_samples(
     n_tp = min(num_tp, len(tp_all))
     tp_idx = rng.choice(tp_all, size=n_tp, replace=False) if n_tp > 0 else tp_all
 
-    print(f"\n[샘플 분석] threshold={threshold:.4f}")
+    print(f"\n[샘플 분석] threshold={threshold:.6e}")
     print(f"  전체 샘플      : {len(labels):>5}개")
     print(f"  정상 샘플      : {(labels ==  1).sum():>5}개")
     print(f"  이상 샘플      : {(labels == -1).sum():>5}개")
@@ -139,7 +139,7 @@ def draw_result_image(
     )
     cv2.putText(
         img,
-        f"Score: {score:.4f}",
+        f"Score: {score:.6e}",
         (8, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.47,
@@ -149,7 +149,7 @@ def draw_result_image(
     )
     cv2.putText(
         img,
-        f"Thr  : {threshold:.4f}",
+        f"Thr  : {threshold:.6e}",
         (8, 57),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.41,
@@ -174,6 +174,70 @@ def draw_result_image(
     )
 
     return img
+
+
+def plot_score_distribution(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    threshold: float,
+) -> "matplotlib.figure.Figure":
+    """Plot distance score histogram for normal/anomaly with threshold line.
+
+    Args:
+        scores:    1-D array of distance scores for each sample.
+        labels:    1-D array of ground-truth labels (+1 normal, -1 anomaly).
+        threshold: Decision threshold drawn as a vertical dashed line.
+
+    Returns:
+        matplotlib Figure — caller is responsible for closing it.
+    """
+    import matplotlib.pyplot as plt
+
+    normal_scores = scores[labels == 1]
+    anomaly_scores = scores[labels == -1]
+
+    all_min = float(scores.min())
+    all_max = float(scores.max())
+    bins = np.linspace(all_min, all_max, min(60, max(10, len(scores) // 5)))
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    if len(normal_scores) > 0:
+        ax.hist(
+            normal_scores,
+            bins=bins,
+            color="#4C9BE8",
+            alpha=0.75,
+            label=f"Normal (n={len(normal_scores)})",
+            edgecolor="white",
+            linewidth=0.4,
+        )
+    if len(anomaly_scores) > 0:
+        ax.hist(
+            anomaly_scores,
+            bins=bins,
+            color="#E8604C",
+            alpha=0.75,
+            label=f"Anomaly (n={len(anomaly_scores)})",
+            edgecolor="white",
+            linewidth=0.4,
+        )
+
+    ax.axvline(
+        x=threshold,
+        color="#222222",
+        linestyle="--",
+        linewidth=1.8,
+        label=f"Threshold = {threshold:.4f}",
+    )
+
+    ax.set_xlabel("Distance Score", fontsize=12)
+    ax.set_ylabel("Count", fontsize=12)
+    ax.set_title("Score Distribution", fontsize=14)
+    ax.legend(fontsize=11)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    return fig
 
 
 def draw_inference_image(
@@ -207,14 +271,50 @@ def draw_inference_image(
     cv2.rectangle(overlay, (0, 0), (canvas_size, 62), (40, 40, 40), -1)
     cv2.addWeighted(overlay, 0.72, img, 0.28, 0, img)
 
-    cv2.putText(img, header_text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.47, label_color, 1, cv2.LINE_AA)
-    cv2.putText(img, f"Score: {score:.4f}", (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (220, 220, 220), 1, cv2.LINE_AA)
-    cv2.putText(img, f"Thr  : {threshold:.4f}", (8, 57), cv2.FONT_HERSHEY_SIMPLEX, 0.41, (160, 160, 160), 1, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        header_text,
+        (8, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.47,
+        label_color,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        f"Score: {score:.6e}",
+        (8, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.47,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        f"Thr  : {threshold:.6e}",
+        (8, 57),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.41,
+        (160, 160, 160),
+        1,
+        cv2.LINE_AA,
+    )
 
     fname = os.path.basename(file_path)
     if len(fname) > 22:
         fname = fname[:19] + "..."
-    cv2.putText(img, fname, (8, canvas_size - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        fname,
+        (8, canvas_size - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (160, 160, 160),
+        1,
+        cv2.LINE_AA,
+    )
 
     return img
 
@@ -254,7 +354,7 @@ def draw_and_save(
         save_path = os.path.join(
             result_dir,
             sample_type,
-            f"{sample_type}_{i:04d}_{fname}_score{scores[idx]:.4f}.png",
+            f"{sample_type}_{i:04d}_{fname}_score{scores[idx]:.6e}.png",
         )
         cv2.imwrite(save_path, img)
         img_list.append(img)
@@ -278,7 +378,7 @@ def draw_and_save(
     _, label_color, _ = _STYLE[sample_type]
     cv2.putText(
         title_bar,
-        f"{sample_type} Samples  ({len(display_idx)} shown, threshold={threshold:.4f})",
+        f"{sample_type} Samples  ({len(display_idx)} shown, threshold={threshold:.6e})",
         (10, 36),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.78,
@@ -323,7 +423,7 @@ def main():
     saved_cfg = TrainConfig(**ckpt.get("cfg", {}))
     c = ckpt["c"].to(device)
     print(f"  저장 epoch : {ckpt['epoch']}")
-    print(f"  Best AUC   : {ckpt['best_auc']:.4f}")
+    print(f"  Best AUC   : {ckpt['best_auc']:.6e}")
 
     # 모델 복원
     model = DeepSAD_ResNet50(
@@ -349,8 +449,8 @@ def main():
     print("\n[3단계] 이상 점수 계산")
     scores = compute_scores(model, test_loader, c, device)
     print(
-        f"  min={scores.min():.4f}  max={scores.max():.4f}  "
-        f"mean={scores.mean():.4f}  std={scores.std():.4f}"
+        f"  min={scores.min():.6e}  max={scores.max():.6e}  "
+        f"mean={scores.mean():.6e}  std={scores.std():.6e}"
     )
 
     # 임계값: 학습 시 저장된 값 사용
@@ -360,7 +460,7 @@ def main():
             "체크포인트에 threshold가 없습니다. 해당 모델을 재학습하거나 "
             "최신 train.py로 저장된 체크포인트를 사용하세요."
         )
-    print(f"  Threshold (from checkpoint): {threshold:.4f}")
+    print(f"  Threshold (from checkpoint): {threshold:.6e}")
 
     # 샘플 분류
     print("\n[4단계] 샘플 탐지")
